@@ -19,8 +19,8 @@ env:
   REGISTRY:   us-east1-docker.pkg.dev
 
 jobs:
-
-  # ── Job 1: Matrix Tests ──────────────────────────────────────
+    
+  # job 1
   test:
     name: Test Python ${{ matrix.python-version }}
     runs-on: ubuntu-latest
