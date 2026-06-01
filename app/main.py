@@ -35,6 +35,9 @@ items_db: List[Item] = [
 ]
 
 # ── Endpoint 1: Health ───────────────────────────────────────
+
+
+
 @app.get("/health", response_model=HealthResponse)
 def health():
     return HealthResponse(
