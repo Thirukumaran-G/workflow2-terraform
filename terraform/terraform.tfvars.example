@@ -1,0 +1,6 @@
+project_id  = "YOUR_PROJECT_ID"
+region      = "us-central1"
+environment = "dev"
+app_name    = "fastapi-app"
+image_tag   = "latest"
+github_repo = "YOUR_GITHUB_USERNAME/fastapi-gcp"

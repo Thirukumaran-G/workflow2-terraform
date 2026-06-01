@@ -1,0 +1,70 @@
+name: Bootstrap Infra
+
+on:
+  workflow_dispatch:    # manual trigger only — run once
+    inputs:
+      project_id:
+        description: GCP Project ID
+        required: true
+      region:
+        description: GCP Region
+        required: true
+        default: us-east1
+      bucket:
+        description: Terraform state bucket name
+        required: true
+
+jobs:
+  bootstrap:
+    name: Create WIF and SA
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Auth with project owner credentials
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_BOOTSTRAP_KEY }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.0
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        working-directory: terraform
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ github.event.inputs.bucket }}" \
+            -backend-config="prefix=fastapi-app/terraform.tfstate"
+
+      - name: Terraform Apply Bootstrap modules only
+        working-directory: terraform
+        run: |
+          terraform apply \
+            -auto-approve \
+            -target=module.artifact_registry \
+            -target=module.iam \
+            -target=module.workload_identity \
+            -var="project_id=${{ github.event.inputs.project_id }}" \
+            -var="region=${{ github.event.inputs.region }}" \
+            -var="github_repo=${{ github.repository }}" \
+            -var="image_tag=latest"
+
+      - name: Print secrets to add to GitHub
+        working-directory: terraform
+        run: |
+          echo ""
+          echo "════════════════════════════════════════"
+          echo "ADD THESE TO GITHUB SECRETS"
+          echo "════════════════════════════════════════"
+          echo ""
+          echo "WIF_PROVIDER:"
+          terraform output -raw workload_identity_provider
+          echo ""
+          echo "GCP_SA_EMAIL:"
+          terraform output -raw github_actions_sa_email
+          echo ""
+          echo "════════════════════════════════════════"
