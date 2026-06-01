@@ -1,0 +1,199 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+  REGION:     us-east1
+  APP_NAME:   fastapi-app
+  REGISTRY:   us-east1-docker.pkg.dev
+
+jobs:
+
+  # ── Job 1: Matrix Tests ──────────────────────────────────────
+  test:
+    name: Test Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r app/requirements.txt
+
+      - name: Run tests
+        run: cd app && pytest --tb=short -v
+
+  # ── Job 2: Trivy Scan ────────────────────────────────────────
+  trivy:
+    name: Trivy Security Scan
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image for scan
+        run: docker build -t ${{ env.APP_NAME }}:scan ./app
+
+      - name: Trivy scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.APP_NAME }}:scan
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH
+          exit-code: 1
+
+      - name: Upload to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-results.sarif
+
+  # ── Job 3: Build and Push ────────────────────────────────────
+  build:
+    name: Build and Push Image
+    runs-on: ubuntu-latest
+    needs: [test, trivy]
+    if: github.ref == 'refs/heads/main'
+    outputs:
+      short_sha: ${{ steps.sha.outputs.short }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get short SHA
+        id: sha
+        run: echo "short=${GITHUB_SHA::8}" >> $GITHUB_OUTPUT
+
+      - name: Auth to GCP via OIDC
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_SA_EMAIL }}
+
+      - name: Configure Docker
+        run: |
+          gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev --quiet
+
+      - name: Build and Push
+        run: |
+          IMAGE="${{ env.REGISTRY }}/${{ env.PROJECT_ID }}/${{ env.APP_NAME }}/${{ env.APP_NAME }}"
+          docker build \
+            -t $IMAGE:${{ steps.sha.outputs.short }} \
+            -t $IMAGE:latest \
+            ./app
+          docker push $IMAGE:${{ steps.sha.outputs.short }}
+          docker push $IMAGE:latest
+
+  # ── Job 4: Terraform Deploy ──────────────────────────────────
+  deploy:
+    name: Deploy to Cloud Run
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    outputs:
+      service_url:       ${{ steps.tf-output.outputs.service_url }}
+      previous_revision: ${{ steps.get-revision.outputs.revision }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Auth to GCP via OIDC
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_SA_EMAIL }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.0
+          terraform_wrapper: false
+
+      - name: Get current revision before deploy
+        id: get-revision
+        run: |
+          revision=$(gcloud run services describe \
+            ${{ env.APP_NAME }}-dev \
+            --region=${{ env.REGION }} \
+            --format='value(status.latestReadyRevisionName)' \
+            2>/dev/null || echo "none")
+          echo "revision=$revision" >> $GITHUB_OUTPUT
+
+      - name: Terraform Init
+        working-directory: terraform
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="prefix=fastapi-app/terraform.tfstate"
+
+      - name: Terraform Plan
+        working-directory: terraform
+        run: |
+          terraform plan \
+            -var="project_id=${{ env.PROJECT_ID }}" \
+            -var="region=${{ env.REGION }}" \
+            -var="image_tag=${{ needs.build.outputs.short_sha }}" \
+            -var="github_repo=${{ github.repository }}" \
+            -out=tfplan
+
+      - name: Terraform Apply
+        working-directory: terraform
+        run: terraform apply -auto-approve tfplan
+
+      - name: Get service URL
+        id: tf-output
+        working-directory: terraform
+        run: |
+          url=$(terraform output -raw cloud_run_url)
+          echo "service_url=$url" >> $GITHUB_OUTPUT
+
+  # ── Job 5: Smoke Test ────────────────────────────────────────
+  smoke-test:
+    name: Smoke Test
+    runs-on: ubuntu-latest
+    needs: deploy
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run smoke tests
+        run: |
+          chmod +x scripts/smoke_test.sh
+          ./scripts/smoke_test.sh ${{ needs.deploy.outputs.service_url }}
+
+  # ── Job 6: Rollback on Failure ───────────────────────────────
+  rollback:
+    name: Rollback
+    runs-on: ubuntu-latest
+    needs: [deploy, smoke-test]
+    if: failure() && needs.deploy.outputs.previous_revision != 'none'
+
+    steps:
+      - name: Auth to GCP via OIDC
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_SA_EMAIL }}
+
+      - name: Rollback to previous revision
+        run: |
+          echo "Rolling back to ${{ needs.deploy.outputs.previous_revision }}"
+          gcloud run services update-traffic \
+            ${{ env.APP_NAME }}-dev \
+            --region=${{ env.REGION }} \
+            --to-revisions=${{ needs.deploy.outputs.previous_revision }}=100
+          echo "Rollback complete"
